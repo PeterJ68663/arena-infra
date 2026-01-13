@@ -30,12 +30,25 @@ def _get_public_ip_and_ssh_port(pod):
     return 'N/A', 'N/A'
 
 def _format_status_and_time(last_status_change):
+    """
+    Returns (status, formatted_time) where formatted_time is "Wed Oct 01 16:35"
+    """
     if not isinstance(last_status_change, str):
         return 'N/A', 'N/A'
     if ': ' in last_status_change:
         status, rest = last_status_change.split(': ', 1)
-        status_time = rest.split(' GMT')[0]
-        return status, status_time
+        # rest is like "Wed Oct 01 2025 16:35:44 GMT+0000 (Coordinated Universal Time)"
+        # We want "Wed Oct 01 16:35"
+        # Remove " GMT..." and year, keep weekday, month, day, hour:min
+        time_str = rest.split(' GMT')[0]
+        try:
+            # Try parsing with year and seconds
+            dt = datetime.strptime(time_str, "%a %b %d %Y %H:%M:%S")
+            formatted_time = dt.strftime("%a %d %b %H:%M")
+        except Exception:
+            # Fallback: try to parse without year/seconds, or just return as is
+            formatted_time = time_str
+        return status, formatted_time
     return last_status_change, 'N/A'
 
 def list_pods():
