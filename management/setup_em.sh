@@ -1,4 +1,59 @@
 #!/bin/bash
+#
+# =============================================================================
+# setup_em.sh - Initialize ARENA pods with SSH keys and Git configuration
+# =============================================================================
+#
+# TLDR: Sets up multiple pods in parallel with Git access and machine identity.
+#
+# WHAT IT DOES:
+#   For each machine in MACHINE_NAME_LIST (from config.env), this script:
+#     1. Tests SSH connectivity to the pod
+#     2. Copies a Git SSH key to enable GitHub access
+#     3. Configures ~/.ssh/config for github.com
+#     4. Sets the ARENA repo remote to SSH and pulls latest from main
+#     5. Creates /root/.name with the machine's identity (MACHINE_NAME)
+#
+# USAGE:
+#   ./setup_em.sh [--force]
+#
+# OPTIONS:
+#   --force    Force checkout to main branch (default: stay on current branch)
+#
+# EXAMPLE:
+#   # With config.env containing:
+#   #   MACHINE_NAME_LIST=("alice" "bob" "charlie")
+#   #   MACHINE_NAME_PREFIX="arena-pod"
+#   #
+#   # The script will configure pods:
+#   #   arena-pod-alice, arena-pod-bob, arena-pod-charlie
+#   #
+#   # Each pod gets:
+#   #   - SSH key at /root/.ssh/id_ed25519
+#   #   - Git remote set to git@github.com:OWNER/REPO.git
+#   #   - /root/.name containing: export MACHINE_NAME='alice'
+#
+# LOGS:
+#   Individual: ./logs/init-arena-pod-<name>.log
+#   Combined:   ./logs/init-all-pods.log
+#
+# =============================================================================
+
+# --- Argument Parsing ---
+FORCE_CHECKOUT=false
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --force)
+      FORCE_CHECKOUT=true
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Usage: $0 [--force]"
+      exit 1
+      ;;
+  esac
+done
 
 # Load config.env from parent directory
 source "$(dirname "$0")/../config.env"
@@ -8,12 +63,12 @@ logdir="$(dirname "$0")/../logs"
 # SSH key to use for connecting to the pods
 SSH_KEY_PATH=$SHARED_SSH_KEY_PATH
 # Local path to the private SSH key that will be copied TO the pods for Git operations
-GIT_SSH_KEY_LOCAL=$SHARED_SSH_KEY_PATH
+GIT_SSH_KEY_LOCAL=${GIT_SSH_KEY_LOCAL:-"/root/.ssh/arena_infra_key"}
 
 # User for SSH connection (should be 'root' as per your Docker setup)
 SSH_USER="root"
 # Remote path where the GIT_SSH_KEY_LOCAL will be copied on the pod
-GIT_SSH_KEY_REMOTE=${SHARED_SSH_KEY_PATH:="/root/.ssh/id_ed25519"}
+GIT_SSH_KEY_REMOTE=${GIT_SSH_KEY_REMOTE:-"/root/.ssh/id_ed25519"}
 
 # ARENA Repository details (ensure this matches what was cloned in Docker)
 # If you used ARENA_REPO_ARG in Docker build, adjust this accordingly.
@@ -33,6 +88,7 @@ mkdir -p $logdir
 # Function to process a single host
 process_host() {
   local machine_name="$1"
+  local force_checkout="$2"
   local pod_hostname="${MACHINE_NAME_PREFIX}-${machine_name}" # Assuming this is how your pods are named/accessible
   local logfile="$logdir/init-${pod_hostname}.log"
 
@@ -92,7 +148,11 @@ process_host() {
   echo "[${pod_hostname}] SSH config updated for github.com." | tee -a "$logfile"
 
   # 4. Configure Git remote for SSH and pull updates
-  echo "[${pod_hostname}] Configuring Git remote for SSH and pulling updates from ${DEFAULT_BRANCH}..." | tee -a "$logfile"
+  if [ "$force_checkout" = "true" ]; then
+    echo "[${pod_hostname}] Configuring Git remote for SSH and forcing checkout to ${DEFAULT_BRANCH}..." | tee -a "$logfile"
+  else
+    echo "[${pod_hostname}] Configuring Git remote for SSH and pulling updates (staying on current branch)..." | tee -a "$logfile"
+  fi
   # Ensure GitHub is in known_hosts (Docker image should do this, but good to be safe or re-verify)
   # ssh -i "$SSH_KEY_PATH" "${SSH_USER}@${pod_hostname}" "ssh-keyscan -t rsa github.com >> /root/.ssh/known_hosts" >> "$logfile" 2>&1
 
@@ -100,11 +160,11 @@ process_host() {
   # - Navigate to the repository
   # - Set the remote URL to the SSH version
   # - Fetch updates from origin
-  # - Reset to the latest from the specified branch (handles diverged histories if any, use with care)
-  #   Alternatively, use 'git pull origin ${DEFAULT_BRANCH}' if you prefer a merge or rebase strategy.
-  #   'git checkout ${DEFAULT_BRANCH} && git reset --hard origin/${DEFAULT_BRANCH}' is a forceful way to match the remote.
-  #   A simple 'git pull origin ${DEFAULT_BRANCH}' is often sufficient.
-  local git_commands="cd \"${ARENA_REPO_PATH}\" && \
+  # - If --force: checkout to main and reset hard
+  # - If not --force: stay on current branch, pull if on main, otherwise just pull
+  local git_commands
+  if [ "$force_checkout" = "true" ]; then
+    git_commands="cd \"${ARENA_REPO_PATH}\" && \
 git remote set-url origin \"${ARENA_REMOTE_SSH_URL}\" && \
 echo 'Remote URL set to SSH.' && \
 git fetch origin && \
@@ -115,6 +175,25 @@ git reset --hard \"origin/${DEFAULT_BRANCH}\" && \
 echo 'Reset to origin/${DEFAULT_BRANCH}.' && \
 git submodule update --init --recursive && \
 echo 'Updated submodules.'"
+  else
+    # Stay on current branch, update accordingly
+    git_commands="cd \"${ARENA_REPO_PATH}\" && \
+git remote set-url origin \"${ARENA_REMOTE_SSH_URL}\" && \
+echo 'Remote URL set to SSH.' && \
+git fetch origin && \
+echo 'Fetched from origin.' && \
+CURRENT_BRANCH=\$(git rev-parse --abbrev-ref HEAD) && \
+echo \"Current branch: \$CURRENT_BRANCH\" && \
+if [ \"\$CURRENT_BRANCH\" = \"${DEFAULT_BRANCH}\" ]; then \
+  git reset --hard \"origin/${DEFAULT_BRANCH}\" && \
+  echo 'Reset to origin/${DEFAULT_BRANCH}.'; \
+else \
+  git pull && \
+  echo 'Pulled latest changes.'; \
+fi && \
+git submodule update --init --recursive && \
+echo 'Updated submodules.'"
+  fi
 # Using git reset --hard ensures the local matches the remote branch exactly.
 # If you have local changes you don't want to lose, this is destructive.
 # For CI/CD or fresh setups, it's often desired.
@@ -163,10 +242,15 @@ if [ ! -f "$SSH_KEY_PATH" ]; then
   exit 1
 fi
 
+if [ "$FORCE_CHECKOUT" = "true" ]; then
+  echo "Running with --force: will checkout to ${DEFAULT_BRANCH} branch on all pods."
+else
+  echo "Running without --force: will stay on current branch (update to latest if on ${DEFAULT_BRANCH})."
+fi
 
 active_pids=()
 for machine_name_suffix in "${MACHINE_NAME_LIST[@]}"; do
-  process_host "$machine_name_suffix" &
+  process_host "$machine_name_suffix" "$FORCE_CHECKOUT" &
   active_pids+=($!)
 
   # Limit parallel processes
@@ -194,3 +278,31 @@ cat $logdir/init-${MACHINE_NAME_PREFIX}-*.log > $logdir/init-all-pods.log 2>/dev
 echo "Combined log saved to ./logs/init-all-pods.log"
 
 echo "--- All Pods Processed ---"
+
+# ------------------------------------------------------------
+# COMMANDS RUN (per pod):
+#   # 1. Test SSH connection
+#   ssh -i $SSH_KEY_PATH root@<pod> exit
+#
+#   # 2. Copy Git SSH key
+#   scp -i $SSH_KEY_PATH $GIT_SSH_KEY_LOCAL root@<pod>:/root/.ssh/id_ed25519
+#   ssh ... "chmod 600 /root/.ssh/id_ed25519"
+#
+#   # 3. Configure SSH for GitHub
+#   ssh ... "mkdir -p /root/.ssh && \
+#            sed -i '/^# BEGIN arena-infra/,/^# END arena-infra/d' /root/.ssh/config && \
+#            printf 'Host github.com\n  IdentityFile /root/.ssh/id_ed25519\n' >> /root/.ssh/config"
+#
+#   # 4. Pull latest code (behavior depends on --force flag)
+#   # Without --force: stay on current branch, reset if on main, pull otherwise
+#   # With --force: checkout to main and reset hard
+#   ssh ... "cd /root/ARENA && \
+#            git remote set-url origin git@github.com:OWNER/REPO.git && \
+#            git fetch origin && \
+#            # if --force: git checkout main && git reset --hard origin/main
+#            # else: stay on branch, reset if main, pull if other
+#            git submodule update --init --recursive"
+#
+#   # 5. Set machine identity
+#   ssh ... "echo \"export MACHINE_NAME='alice'\" > /root/.name"
+# ------------------------------------------------------------

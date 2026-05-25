@@ -1,191 +1,187 @@
 #!/bin/bash
-# Get DAY_NAME from command line argument
-if [ $# -eq 0 ]; then
-    echo "ERROR: DAY_NAME (eg: "w0d1") argument required"
-    echo "Example: $0 w0d1"
-    exit 1
-fi
+# Commit and push changes on all machines (to their CURRENT branch)
+# Will NOT push to main/master branches for safety
 
-DAY_NAME="$1"
+EXCLUDE_LIST=()
+COMMIT_MSG="auto sync $(date +%Y-%m-%d_%H:%M)"
 
-# --- Configuration (from ../config.env) ---
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --exclude)
+            if [ -z "$2" ] || [[ "$2" == --* ]]; then
+                echo "ERROR: --exclude requires at least one host name"
+                exit 1
+            fi
+            shift
+            while [[ $# -gt 0 ]] && [[ "$1" != --* ]]; do
+                EXCLUDE_LIST+=("$1")
+                shift
+            done
+            ;;
+        -m|--message)
+            if [ -z "$2" ]; then
+                echo "ERROR: -m/--message requires a commit message"
+                exit 1
+            fi
+            COMMIT_MSG="$2"
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage: $0 [--exclude host1 host2 ...] [-m 'commit message']"
+            echo "Example: $0"
+            echo "         $0 --exclude apple bloom"
+            echo "         $0 -m 'end of day backup'"
+            exit 0
+            ;;
+        *)
+            echo "ERROR: Unknown argument: $1"
+            echo "Use --help for usage"
+            exit 1
+            ;;
+    esac
+done
+
+# --- Configuration ---
 source "$(dirname "$0")/../config.env"
 
 SSH_KEY="$SHARED_SSH_KEY_PATH"
-
-# User for SSH connection
-SSH_USER="root"  # Change this if you use a different user
-
-# Max number of parallel processes
+SSH_USER="root"
 MAX_PARALLEL=10
+REMOTE_GIT_DIR="ARENA_3.0"
 
-# Base directory for Git operations on remote host
-REMOTE_GIT_DIR="ARENA_3.0" # Assumes this exists under $HOME
+SSH_OPTS=(-o ConnectTimeout=30 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i "$SSH_KEY")
+SSH_TEST_OPTS=(-q -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i "$SSH_KEY")
 
-# SSH options
-SSH_OPTS=(
-  -o ConnectTimeout=30      # Longer timeout for git operations
-  -o StrictHostKeyChecking=no
-  -o UserKnownHostsFile=/dev/null
-  -o LogLevel=ERROR
-  -i "$SSH_KEY"
-)
-SSH_CONNECT_TEST_OPTS=(
-  -q -o BatchMode=yes -o ConnectTimeout=5
-  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-  -o LogLevel=ERROR -i "$SSH_KEY"
-)
-# --- End Configuration ---
-
-# Temporary directory for logs
 TMP_LOG_DIR="$(dirname "$0")/../logs/tmp_git_sync_logs"
 mkdir -p "$TMP_LOG_DIR"
 
-# Function to process a single host
 process_host() {
-  local nato_name="$1"
-  local host="$MACHINE_NAME_PREFIX-$nato_name"
-  local logfile="$TMP_LOG_DIR/log_$nato_name.log"
-  # Define the branch name - depends on nato_name
-  local BRANCH_NAME="autocommit-$MACHINE_NAME_PREFIX-$DAY_NAME-$nato_name"
-  # Construct remote path using \$HOME for remote expansion
-  local remote_repo_path="\$HOME/$REMOTE_GIT_DIR"
+    local nato_name="$1"
+    local host="$MACHINE_NAME_PREFIX-$nato_name"
+    local logfile="$TMP_LOG_DIR/log_$nato_name.log"
 
-  echo "=== Processing host $host (Branch: $BRANCH_NAME) ===" > "$logfile"
+    {
+        echo "=== $host ==="
 
-  # --- Connection Test ---
-  echo "Testing connection to $host..." >> "$logfile"
-  if ! ssh "${SSH_CONNECT_TEST_OPTS[@]}" "$SSH_USER@$host" exit; then
-    echo "[FAIL] Connection failed or timed out." >> "$logfile"
-    return 1 # Connection Failure
-  fi
-  echo "Connection successful." >> "$logfile"
+        # Connection test
+        if ! ssh "${SSH_TEST_OPTS[@]}" "$SSH_USER@$host" exit; then
+            echo "[FAIL] Connection failed"
+            exit 1
+        fi
 
-  # --- Construct Git Commands with Enhanced Logging & Error Checks ---
-  # $BRANCH_NAME is expanded locally here.
-  # Commands are chained with &&. || { ...; exit N; } handles errors.
-  # Single quotes protect echo messages. Redirect git config checks.
-  local git_commands="cd \"$remote_repo_path\" && \
-echo '--- [1/6] Checking Git Status Before Changes ---' && \
-git status --short && \
-echo '--- [2/6] Configuring Git Identity (if needed) ---' && \
-(git config --get user.name >/dev/null 2>&1 || git config user.name 'Arena Autocommit') && \
-(git config --get user.email >/dev/null 2>&1 || git config user.email 'autocommit@arena.education') && \
-echo '--- [3/6] Staging All Changes ---' && \
-git add . && \
-echo '--- [4/6] Committing Changes ---' && \
-( git diff --cached --quiet && echo '[INFO] Nothing to commit; continuing' || git commit -m 'auto commit $DAY_NAME' ) || { echo '[ERROR] Commit failed'; exit 10; } && \
-echo '--- [5/6] Creating/Checking Out Branch: $BRANCH_NAME ---' && \
-(git checkout -b '$BRANCH_NAME' 2>/dev/null || git checkout '$BRANCH_NAME' || git checkout -t 'origin/$BRANCH_NAME') && \
-echo '--- [6/6] Pushing Branch to Origin ---' && \
-(git push --set-upstream origin '$BRANCH_NAME' || { echo '[ERROR] Push failed'; exit 12; }) && \
-echo '--- Git operations completed successfully ---'"
+        # Run git commands remotely (using unquoted heredoc for local variable expansion)
+        ssh "${SSH_OPTS[@]}" "$SSH_USER@$host" bash <<REMOTE_SCRIPT
+cd "\$HOME/$REMOTE_GIT_DIR" || exit 1
 
-  echo "Running Git commands on $host..." >> "$logfile"
-  echo "Executing on remote:" >> "$logfile"
-  # Log the command, replacing \$HOME for readability in the log
-  echo "$git_commands" | sed "s/\\\$HOME/~/" >> "$logfile"
-  echo "--- Remote Output ---" >> "$logfile"
+BRANCH=\$(git rev-parse --abbrev-ref HEAD)
+echo "Branch: \$BRANCH"
 
-  # Execute the command sequence via SSH, append output to log
-  ssh "${SSH_OPTS[@]}" "$SSH_USER@$host" "$git_commands" >> "$logfile" 2>&1
-  local ssh_status=$? # Capture the exit status of the *entire* sequence
+# Safety check - don't push to main/master
+if [[ "\$BRANCH" == "main" || "\$BRANCH" == "master" ]]; then
+    echo "[SKIP] Won't push to \$BRANCH - use init_branches.sh first"
+    exit 2
+fi
 
-  # --- Report Result based on SSH exit status ---
-  if [ $ssh_status -eq 0 ]; then
-    echo "[ OK ] Git commands completed successfully on $host." >> "$logfile"
-    return 0 # Success
-  else
-    # Check for specific exit codes we defined
-    local reason=""
-    case $ssh_status in
-      10) reason="(Commit Failed)" ;;
-      11) reason="(Branch Creation/Checkout Failed)" ;;
-      12) reason="(Push Failed)" ;;
-       *) reason="(Unknown Git Error - Exit Status: $ssh_status)" ;;
-    esac
-    echo "[FAIL] Git commands failed on $host $reason. Check log for details." >> "$logfile"
-    return 3 # Git Command Failure (use a distinct code)
-  fi
+# Configure git identity if needed
+git config user.name 2>/dev/null || git config user.name "Arena Autocommit"
+git config user.email 2>/dev/null || git config user.email "autocommit@arena.education"
+
+# Stage all changes
+git add .
+
+# Check if there's anything to commit
+if git diff --cached --quiet; then
+    echo "[OK] Nothing to commit"
+else
+    git commit -m "$COMMIT_MSG" || exit 1
+    echo "[OK] Committed"
+fi
+
+# Push (set upstream if needed)
+git push -u origin "\$BRANCH" || exit 1
+echo "[OK] Pushed to \$BRANCH"
+REMOTE_SCRIPT
+
+        local status=$?
+        case $status in
+            0) echo "[ OK ] Synced successfully" ;;
+            2) echo "[SKIP] Skipped (protected branch)" ;;
+            *) echo "[FAIL] Git operation failed (exit $status)" ;;
+        esac
+    } > "$logfile" 2>&1
 }
 
-# --- Main Execution Logic ---
-pids=()
-
-echo "Launching Git sync process for ${#MACHINE_NAME_LIST[@]} hosts (Max parallel: $MAX_PARALLEL)..."
-
-# Process hosts in parallel, redirecting output
+# --- Main ---
+FILTERED_HOST_LIST=()
 for name in "${MACHINE_NAME_LIST[@]}"; do
-  log_file="$TMP_LOG_DIR/log_$name.log"
-
-  if [ ${#pids[@]} -ge $MAX_PARALLEL ]; then
-    wait -n "${pids[@]}"
-    new_pids=()
-    for pid_chk in "${pids[@]}"; do
-        if kill -0 "$pid_chk" 2>/dev/null; then new_pids+=("$pid_chk"); fi
+    excluded=false
+    for ex in "${EXCLUDE_LIST[@]}"; do
+        [[ "$name" == "$ex" ]] && excluded=true && break
     done
-    pids=("${new_pids[@]}")
-  fi
-
-  # Launch in background
-  process_host "$name" > "$log_file" 2>&1 &
-  pids+=($!)
+    $excluded || FILTERED_HOST_LIST+=("$name")
 done
 
-echo "Waiting for remaining processes (${#pids[@]}) to finish..."
+if [ ${#EXCLUDE_LIST[@]} -gt 0 ]; then
+    echo "Excluding: ${EXCLUDE_LIST[*]}"
+fi
+echo "Syncing ${#FILTERED_HOST_LIST[@]} hosts (max parallel: $MAX_PARALLEL)..."
+echo "Commit message: $COMMIT_MSG"
+echo
+
+# Launch parallel processes
+pids=()
+for name in "${FILTERED_HOST_LIST[@]}"; do
+    while [ ${#pids[@]} -ge $MAX_PARALLEL ]; do
+        wait -n 2>/dev/null || break
+        new_pids=()
+        for p in "${pids[@]}"; do
+            kill -0 "$p" 2>/dev/null && new_pids+=("$p")
+        done
+        pids=("${new_pids[@]}")
+    done
+
+    process_host "$name" &
+    pids+=($!)
+done
+
 wait
 
-echo "All processes finished. Consolidating results..."
+# --- Results ---
 echo
+successful=() skipped=() conn_failed=() git_failed=()
 
-# --- Consolidate and Print Results ---
-successful_hosts=()
-conn_failed_hosts=()
-git_failed_hosts=()
-
-for name in "${MACHINE_NAME_LIST[@]}"; do
-  host="${MACHINE_NAME_PREFIX}-$name"
-  log_file="$TMP_LOG_DIR/log_$name.log"
-  if [ -f "$log_file" ]; then
-    # Print the captured output for this host
-    cat "$log_file"
-    echo # Add a blank line between host outputs
-
-    # Determine status by searching the log file content
-    if grep -q "\[ OK \] Git commands completed successfully" "$log_file"; then
-      successful_hosts+=("$host")
-    elif grep -q "\[FAIL\] Connection failed" "$log_file"; then
-      conn_failed_hosts+=("$host")
-    elif grep -q "\[FAIL\] Git commands failed" "$log_file"; then
-      # Extract reason if possible
-      reason=$(grep "\[FAIL\] Git commands failed" "$log_file" | sed -n 's/.*failed on .* \(\(.*\)\)\. Check log.*/\1/p')
-      if [ -n "$reason" ]; then
-         git_failed_hosts+=("$host $reason")
-      else
-         git_failed_hosts+=("$host (Git Failed)")
-      fi
+for name in "${FILTERED_HOST_LIST[@]}"; do
+    host="${MACHINE_NAME_PREFIX}-$name"
+    log="$TMP_LOG_DIR/log_$name.log"
+    
+    [ -f "$log" ] && cat "$log" && echo
+    
+    if grep -q "\[ OK \] Synced" "$log" 2>/dev/null; then
+        branch=$(grep "^Branch:" "$log" | cut -d' ' -f2)
+        successful+=("$host → $branch")
+    elif grep -q "\[SKIP\]" "$log" 2>/dev/null; then
+        skipped+=("$host (on main/master)")
+    elif grep -q "Connection failed" "$log" 2>/dev/null; then
+        conn_failed+=("$host")
     else
-       git_failed_hosts+=("$host (Unknown Error/State)")
+        git_failed+=("$host")
     fi
-  else
-    conn_failed_hosts+=("$host (Log file missing)")
-  fi
 done
 
-# --- Final Summary ---
-echo "--- Summary ---"
-echo "Total hosts processed: ${#MACHINE_NAME_LIST[@]}"
+echo "=========================================="
+echo "SUMMARY"
+echo "=========================================="
 echo
-echo "[ OK ] Successful Hosts (${#successful_hosts[@]}):"
-if [ ${#successful_hosts[@]} -gt 0 ]; then printf "  %s\n" "${successful_hosts[@]}"; else echo "  None"; fi
+echo "[ OK ] Synced (${#successful[@]}):"
+if [ ${#successful[@]} -gt 0 ]; then printf "  %s\n" "${successful[@]}"; else echo "  None"; fi
 echo
-echo "[FAIL] Connection Failed Hosts (${#conn_failed_hosts[@]}):"
-if [ ${#conn_failed_hosts[@]} -gt 0 ]; then printf "  %s\n" "${conn_failed_hosts[@]}"; else echo "  None"; fi
+echo "[SKIP] Skipped - protected branch (${#skipped[@]}):"
+if [ ${#skipped[@]} -gt 0 ]; then printf "  %s\n" "${skipped[@]}"; else echo "  None"; fi
 echo
-echo "[FAIL] Git Command Failed Hosts (${#git_failed_hosts[@]}):"
-if [ ${#git_failed_hosts[@]} -gt 0 ]; then printf "  %s\n" "${git_failed_hosts[@]}"; else echo "  None"; fi
-echo "---------------"
-
-# --- Cleanup ---
-# rm -rf "$TMP_LOG_DIR"
-echo "Individual logs are in $TMP_LOG_DIR"
+echo "[FAIL] Connection failed (${#conn_failed[@]}):"
+if [ ${#conn_failed[@]} -gt 0 ]; then printf "  %s\n" "${conn_failed[@]}"; else echo "  None"; fi
+echo
+echo "[FAIL] Git failed (${#git_failed[@]}):"
+if [ ${#git_failed[@]} -gt 0 ]; then printf "  %s\n" "${git_failed[@]}"; else echo "  None"; fi
+echo
+echo "Logs: $TMP_LOG_DIR"
